@@ -1,56 +1,27 @@
 import { useCallback, useEffect, useState } from 'react'
-import { BrowserProvider, Contract, JsonRpcProvider, ZeroHash, id } from 'ethers'
-import { proofOfAidAbi } from './abi'
+import { BrowserProvider } from 'ethers'
+import type { Contract } from 'ethers'
 import {
   CONTRACT_ADDRESS,
   ETHERSCAN_BASE,
   SEPOLIA_CHAIN_ID,
   SEPOLIA_CHAIN_ID_HEX,
-  SEPOLIA_RPC,
 } from './config'
-
-// Minimal shape of the wallet object MetaMask injects into the page.
-type EthereumProvider = {
-  request: (args: { method: string; params?: unknown[] }) => Promise<unknown>
-  on: (event: string, handler: () => void) => void
-  removeListener: (event: string, handler: () => void) => void
-}
-
-declare global {
-  interface Window {
-    ethereum?: EthereumProvider
-  }
-}
-
-type Roles = { admin: boolean; ngo: boolean; verifier: boolean }
-type Stats = { campaigns: bigint; records: bigint }
-
-// Reads go through a public RPC so the data is visible without a wallet.
-const readProvider = new JsonRpcProvider(SEPOLIA_RPC, SEPOLIA_CHAIN_ID, { staticNetwork: true })
-const readContract = new Contract(CONTRACT_ADDRESS, proofOfAidAbi, readProvider)
-
-// Role ids are the same hashes the contract uses (keccak256 of the role name).
-const ADMIN_ROLE = ZeroHash // DEFAULT_ADMIN_ROLE is bytes32(0)
-const NGO_ROLE = id('NGO_ROLE')
-const VERIFIER_ROLE = id('VERIFIER_ROLE')
-
-const shorten = (address: string) => `${address.slice(0, 6)}…${address.slice(-4)}`
-
-function errorMessage(error: unknown): string {
-  if (typeof error === 'object' && error !== null) {
-    const e = error as { code?: number | string; shortMessage?: string; message?: string }
-    if (e.code === 4001 || e.code === 'ACTION_REJECTED') return 'Request cancelled in the wallet.'
-    return e.shortMessage ?? e.message ?? 'Something went wrong.'
-  }
-  return 'Something went wrong.'
-}
+import { errorMessage, getWriteContract, loadAll, loadRoles, readContract, shorten } from './chain'
+import type { CampaignView, Roles, RunTx } from './chain'
+import { AdminPanel } from './components/AdminPanel'
+import { CampaignList } from './components/CampaignList'
+import { NgoPanel } from './components/NgoPanel'
+import { VerifierPanel } from './components/VerifierPanel'
 
 function App() {
   const [account, setAccount] = useState<string | null>(null)
   const [chainId, setChainId] = useState<number | null>(null)
   const [roles, setRoles] = useState<Roles | null>(null)
-  const [stats, setStats] = useState<Stats | null>(null)
+  const [campaigns, setCampaigns] = useState<CampaignView[] | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [status, setStatus] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
 
   const hasWallet = typeof window !== 'undefined' && Boolean(window.ethereum)
 
@@ -68,14 +39,10 @@ function App() {
     }
   }, [])
 
-  // Load the on-chain counters for the public view.
-  const refreshStats = useCallback(async () => {
+  // Load every campaign and record. Reads use the public RPC unless a contract is passed in.
+  const refreshData = useCallback(async (contract: Contract = readContract) => {
     try {
-      const [campaigns, records] = (await Promise.all([
-        readContract.campaignCount(),
-        readContract.recordCount(),
-      ])) as [bigint, bigint]
-      setStats({ campaigns, records })
+      setCampaigns(await loadAll(contract))
     } catch (e) {
       setError(`Could not read the contract: ${errorMessage(e)}`)
     }
@@ -83,7 +50,7 @@ function App() {
 
   useEffect(() => {
     void refreshWallet()
-    void refreshStats()
+    void refreshData()
 
     const eth = window.ethereum
     if (!eth) return
@@ -94,7 +61,7 @@ function App() {
       eth.removeListener('accountsChanged', onChange)
       eth.removeListener('chainChanged', onChange)
     }
-  }, [refreshWallet, refreshStats])
+  }, [refreshWallet, refreshData])
 
   // Work out which roles the connected account holds.
   useEffect(() => {
@@ -105,12 +72,8 @@ function App() {
     let cancelled = false
     void (async () => {
       try {
-        const [admin, ngo, verifier] = (await Promise.all([
-          readContract.hasRole(ADMIN_ROLE, account),
-          readContract.hasRole(NGO_ROLE, account),
-          readContract.hasRole(VERIFIER_ROLE, account),
-        ])) as [boolean, boolean, boolean]
-        if (!cancelled) setRoles({ admin, ngo, verifier })
+        const found = await loadRoles(readContract, account)
+        if (!cancelled) setRoles(found)
       } catch (e) {
         if (!cancelled) setError(`Could not read roles: ${errorMessage(e)}`)
       }
@@ -119,6 +82,33 @@ function App() {
       cancelled = true
     }
   }, [account])
+
+  // Sends one transaction through the wallet, waits for it, then reloads the data.
+  const runTx = useCallback<RunTx>(
+    async (label, send) => {
+      setError(null)
+      setBusy(true)
+      setStatus(`${label}: confirm in MetaMask…`)
+      try {
+        const contract = await getWriteContract()
+        const tx = await send(contract)
+        setStatus(`${label}: waiting for the network to confirm…`)
+        await tx.wait()
+        // Read back through the wallet's own connection so the new block is always visible.
+        await refreshData(contract)
+        if (account) setRoles(await loadRoles(contract, account))
+        setStatus(`${label}: done.`)
+        return true
+      } catch (e) {
+        setStatus(null)
+        setError(errorMessage(e))
+        return false
+      } finally {
+        setBusy(false)
+      }
+    },
+    [refreshData, account],
+  )
 
   async function connectWallet() {
     if (!window.ethereum) return
@@ -146,6 +136,7 @@ function App() {
   }
 
   const wrongNetwork = account !== null && chainId !== SEPOLIA_CHAIN_ID
+  const canWrite = account !== null && !wrongNetwork && !busy
 
   return (
     <main className="page">
@@ -157,6 +148,12 @@ function App() {
       {error && (
         <div className="notice notice-error" role="alert">
           {error}
+        </div>
+      )}
+
+      {status && (
+        <div className="notice notice-ok" role="status">
+          {status}
         </div>
       )}
 
@@ -172,7 +169,7 @@ function App() {
 
         {hasWallet && !account && (
           <>
-            <p>Connect your wallet to see your role.</p>
+            <p>Connect your wallet to see your role and use the tools for it.</p>
             <button onClick={connectWallet}>Connect MetaMask</button>
           </>
         )}
@@ -203,26 +200,42 @@ function App() {
         )}
       </section>
 
-      <section className="card">
-        <h2>On-chain data</h2>
-        <dl className="stats">
-          <div>
-            <dt>Campaigns</dt>
-            <dd>{stats ? stats.campaigns.toString() : '…'}</dd>
-          </div>
-          <div>
-            <dt>Distribution records</dt>
-            <dd>{stats ? stats.records.toString() : '…'}</dd>
-          </div>
-        </dl>
-        <p className="muted">
-          Contract{' '}
-          <a href={`${ETHERSCAN_BASE}/address/${CONTRACT_ADDRESS}`} className="mono">
-            {shorten(CONTRACT_ADDRESS)}
-          </a>{' '}
-          on Sepolia
-        </p>
-      </section>
+      {account && roles?.admin && <AdminPanel canWrite={canWrite} runTx={runTx} />}
+
+      {account && roles?.ngo && (
+        <NgoPanel account={account} campaigns={campaigns ?? []} canWrite={canWrite} runTx={runTx} />
+      )}
+
+      {account && roles?.verifier && (
+        <VerifierPanel
+          account={account}
+          campaigns={campaigns ?? []}
+          canWrite={canWrite}
+          runTx={runTx}
+        />
+      )}
+
+      <div className="section-head">
+        <h2>Campaigns</h2>
+        <button className="button-secondary" onClick={() => void refreshData()}>
+          Refresh
+        </button>
+      </div>
+      <p className="muted small">
+        Figures are labelled by what has actually been established: <strong>reported</strong> is
+        what the NGO claims, <strong>verified</strong> is what an independent verifier accepted
+        after reviewing the evidence. Verified does not prove a delivery physically happened.
+      </p>
+
+      <CampaignList campaigns={campaigns} />
+
+      <footer className="footer muted small">
+        Contract{' '}
+        <a href={`${ETHERSCAN_BASE}/address/${CONTRACT_ADDRESS}`} className="mono">
+          {shorten(CONTRACT_ADDRESS)}
+        </a>{' '}
+        on the Sepolia test network
+      </footer>
     </main>
   )
 }
